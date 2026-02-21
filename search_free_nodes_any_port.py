@@ -3,138 +3,151 @@ import requests
 import time
 import os
 import re
-from urllib.parse import urlparse
 
-# GitHub API 配置（必须设置环境变量 GH_TOKEN）
+# ==================== 配置区 ====================
 GH_TOKEN = os.environ.get('GH_TOKEN')
 if not GH_TOKEN:
-    print("请设置环境变量 GH_TOKEN，否则 API 限速很严重")
+    print("错误：请先设置环境变量 GH_TOKEN")
+    print("示例：export GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
     exit(1)
 
 HEADERS = {
     'Authorization': f'token {GH_TOKEN}',
-    'Accept': 'application/vnd.github.v3+json'
+    'Accept': 'application/vnd.github.v3+json',
+    'X-GitHub-Api-Version': '2022-11-28'  # 明确使用文档版本，避免默认旧版
 }
 
-# 简化查询，避免 422 解析错误（先用这个跑通，再逐步加关键词）
-# 推荐从简单开始测试
-SEARCH_QUERY = 'trojan :\\d{4,} extension:txt'   # 最稳定版本
-# 备选稍复杂版（如果上面能跑通，再试这个）
-# SEARCH_QUERY = 'trojan OR vless :\\d{4,} extension:txt OR extension:yaml'
+# 最稳定的查询写法（先用这个跑通，成功后再逐步加条件）
+SEARCH_QUERY = 'trojan extension:txt'          # 极简版，几乎不会报 422
+# 推荐进阶版（如果上面成功，换成这个再跑）
+# SEARCH_QUERY = 'trojan OR vless extension:txt'
+# 再进阶（端口匹配版）
+# SEARCH_QUERY = 'trojan :\\d{4,} extension:txt'
 
 API_URL = 'https://api.github.com/search/code'
-PER_PAGE = 100
+PER_PAGE = 50   # 调小一点，减少单次压力
 
-# 测试节点（支持任意端口，统一优先尝试 HTTPS）
-def test_node(ip_port, sni=None):
-    ip, port = ip_port.split(':')
-    url = f"https://{ip}:{port}"
+# ==================== 测试函数 ====================
+def test_node(ip_port):
+    """简单测试端口是否能连通，优先 HTTPS"""
+    if ':' not in ip_port:
+        return False, "格式错误"
     
-    headers = {}
-    if sni:
-        headers['Host'] = sni
+    ip, port = ip_port.split(':', 1)
+    url_https = f"https://{ip}:{port}"
     
-    # 优先尝试 HTTPS（大多数节点都是 TLS）
     try:
-        resp = requests.get(url, headers=headers, timeout=6, verify=False)
-        status = f"HTTPS OK ({resp.status_code})"
-        return True, status
-    except requests.exceptions.RequestException as e:
-        err_msg = str(e)[:80]
-        # HTTPS 失败 → 再尝试 HTTP（覆盖极少数明文节点）
+        r = requests.get(url_https, timeout=7, verify=False)
+        return True, f"HTTPS 连通 ({r.status_code})"
+    except Exception as e:
+        err = str(e)[:80]
         try:
-            http_url = f"http://{ip}:{port}"
-            resp_http = requests.get(http_url, headers=headers, timeout=6)
-            status_http = f"HTTP OK ({resp_http.status_code})"
-            return True, status_http
-        except requests.exceptions.RequestException as eh:
-            combined_err = f"HTTPS 失败: {err_msg} | HTTP 也失败: {str(eh)[:60]}"
-            return False, combined_err
+            url_http = f"http://{ip}:{port}"
+            r_http = requests.get(url_http, timeout=7)
+            return True, f"HTTP 连通 ({r_http.status_code})"
+        except Exception as eh:
+            return False, f"失败 - HTTPS: {err} | HTTP: {str(eh)[:50]}"
 
-# 从内容提取所有 IP:端口（不限端口）
-def extract_nodes_from_content(content):
+# ==================== 提取 IP:端口 ====================
+def extract_ip_ports(text):
     nodes = set()
-    # IPv4:端口 或 [IPv6]:端口（端口范围 1024+ 避免系统端口）
-    pattern = r'((?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|\[(?:[0-9a-fA-F:]+)\]):([1-9]\d{3,4}|[1-5]\d{5}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d{1}|6553[0-5])'
-    matches = re.findall(pattern, content)
-    for ip, port in matches:
-        if int(port) >= 1024:
+    # 匹配 IPv4:端口 和 [IPv6]:端口
+    pattern = r'((?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|\[(?:[0-9a-fA-F:]+)\]):(\d{1,5})'
+    for ip, port in re.findall(pattern, text):
+        p = int(port)
+        if 1 <= p <= 65535 and p >= 1024:  # 避免系统保留端口
             nodes.add(f"{ip}:{port}")
-    
-    # 额外提取订阅链接
-    sub_pattern = r'(https?://[^\s"\']+\.(txt|yaml|yml|md|conf|sub|base64|json))'
-    subs = re.findall(sub_pattern, content)
-    for sub in subs:
-        nodes.add(sub[0])
-    
     return nodes
 
-# 主逻辑
+# ==================== 主程序 ====================
+print("开始搜索 GitHub 公开节点配置...")
+print(f"当前查询: {SEARCH_QUERY}\n")
+
 all_nodes = set()
 page = 1
-while True:
-    params = {'q': SEARCH_QUERY, 'per_page': PER_PAGE, 'page': page}
-    resp = requests.get(API_URL, headers=HEADERS, params=params)
-    if resp.status_code != 200:
-        print(f"GitHub API 错误: {resp.status_code} - {resp.text[:300]}")
+total_pages = 1  # 先假设
+
+while page <= total_pages:
+    params = {
+        'q': SEARCH_QUERY,
+        'per_page': PER_PAGE,
+        'page': page
+    }
+    
+    try:
+        resp = requests.get(API_URL, headers=HEADERS, params=params, timeout=15)
+        print(f"页 {page} 请求状态: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            print("错误响应内容：")
+            print(resp.text[:600])
+            break
+            
+        data = resp.json()
+        items = data.get('items', [])
+        
+        if 'total_count' in data:
+            total_count = data['total_count']
+            total_pages = (total_count + PER_PAGE - 1) // PER_PAGE
+            print(f"总匹配数约 {total_count}，预计页数 {total_pages}")
+        
+        if not items:
+            print("本页无结果，结束搜索")
+            break
+        
+        for idx, item in enumerate(items, 1):
+            html_url = item.get('html_url', '')
+            raw_url = html_url.replace('/blob/', '/raw/') if html_url else ''
+            
+            if not raw_url:
+                continue
+                
+            print(f"  [{idx}] 处理: {raw_url}")
+            
+            try:
+                file_resp = requests.get(raw_url, timeout=12)
+                if file_resp.status_code == 200:
+                    found = extract_ip_ports(file_resp.text)
+                    if found:
+                        all_nodes.update(found)
+                        print(f"      发现 {len(found)} 个节点")
+                else:
+                    print(f"      文件下载失败 {file_resp.status_code}")
+            except Exception as e:
+                print(f"      异常: {str(e)[:100]}")
+            
+            time.sleep(1.2)  # 避免触发二级限速
+        
+        page += 1
+        time.sleep(4)  # 页面间延迟
+        
+    except Exception as e:
+        print(f"请求异常: {str(e)}")
         break
-    data = resp.json()
-    items = data.get('items', [])
-    if not items:
-        break
 
-    for item in items:
-        raw_url = item['html_url'].replace('/blob/', '/raw/')
-        try:
-            file_resp = requests.get(raw_url, timeout=10)
-            if file_resp.status_code == 200:
-                content = file_resp.text
-                extracted = extract_nodes_from_content(content)
-                all_nodes.update(extracted)
-                print(f"从 {raw_url} 提取到 {len(extracted)} 个节点/订阅")
-        except Exception as e:
-            print(f"处理 {raw_url} 出错: {e}")
-        time.sleep(1.5)  # 防限速
+print(f"\n搜索结束，共收集到 {len(all_nodes)} 个唯一 IP:端口")
 
-    page += 1
-    time.sleep(5)
+# 简单测试前 20 个（可选全部测试，但免费节点不稳定，建议手动选）
+print("\n测试前 20 个节点（或全部如果少于20）：")
+tested = []
+for node in list(all_nodes)[:20]:
+    ok, msg = test_node(node)
+    status = "可用" if ok else "不可用"
+    print(f"{node:22} → {status}  {msg}")
+    tested.append((node, ok, msg))
+    time.sleep(1.3)
 
-# 加载已有数据
-try:
-    with open('nodes.json', 'r', encoding='utf-8') as f:
-        existing = json.load(f)
-    existing_set = {item['node'] for item in existing if 'node' in item}
-except:
-    existing = []
-    existing_set = set()
+# 保存结果（简单 txt + json）
+with open('found_nodes.txt', 'w', encoding='utf-8') as f:
+    f.write("\n".join(sorted(all_nodes)))
 
-# 测试新节点
-available = []
-for node in all_nodes - existing_set:
-    alive, info = test_node(node)
-    status = "可用" if alive else f"不可用 ({info})"
-    available.append({
-        "node": node,
-        "status": status,
-        "tested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "GitHub 搜索"
-    })
-    print(f"测试 {node}: {status}")
-    time.sleep(1.5)
+with open('found_nodes.json', 'w', encoding='utf-8') as f:
+    json.dump({
+        "query": SEARCH_QUERY,
+        "count": len(all_nodes),
+        "tested": tested,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }, f, ensure_ascii=False, indent=2)
 
-# 合并保存
-output = existing.copy()
-base_priority = max([item.get('priority', 0) for item in existing] + [0]) + 1
-for idx, item in enumerate(available):
-    output.append({
-        "id": item['node'].replace('.', '_').replace(':', '__').replace('[', '').replace(']', ''),
-        "node": item['node'],
-        "status": item['status'],
-        "priority": base_priority + idx,
-        "enabled": "可用" in item['status']
-    })
-
-with open('nodes.json', 'w', encoding='utf-8') as f:
-    json.dump(output, f, ensure_ascii=False, indent=4)
-
-print(f"更新完成！新增 {len(available)} 个节点（其中可用约 {sum(1 for n in available if '可用' in n['status'])} 个）。")
+print("\n结果已保存到 found_nodes.txt 和 found_nodes.json")
+print("建议：把 found_nodes.txt 导入 Clash / v2rayN 等客户端进一步验证")
