@@ -16,8 +16,11 @@ HEADERS = {
     'Accept': 'application/vnd.github.v3+json'
 }
 
-# 搜索关键词：不限端口，覆盖常见协议和订阅文件
-SEARCH_QUERY = '("trojan" OR "vless" OR "vmess" OR "clash" OR "xray" OR "v2ray" OR "hysteria") (":\\d{2,5}" OR "port" OR "订阅") extension:txt OR extension:yaml OR extension:md OR extension:conf OR extension:base64'
+# 简化查询，避免 422 解析错误（先用这个跑通，再逐步加关键词）
+# 推荐从简单开始测试
+SEARCH_QUERY = 'trojan :\\d{4,} extension:txt'   # 最稳定版本
+# 备选稍复杂版（如果上面能跑通，再试这个）
+# SEARCH_QUERY = 'trojan OR vless :\\d{4,} extension:txt OR extension:yaml'
 
 API_URL = 'https://api.github.com/search/code'
 PER_PAGE = 100
@@ -51,15 +54,14 @@ def test_node(ip_port, sni=None):
 # 从内容提取所有 IP:端口（不限端口）
 def extract_nodes_from_content(content):
     nodes = set()
-    # IPv4:端口 或 [IPv6]:端口
-    pattern = r'((?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|\[(?:[0-9a-fA-F:]+)\]):([1-9]\d{0,4}|[1-5]\d{5}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d{1}|6553[0-5])'
+    # IPv4:端口 或 [IPv6]:端口（端口范围 1024+ 避免系统端口）
+    pattern = r'((?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|\[(?:[0-9a-fA-F:]+)\]):([1-9]\d{3,4}|[1-5]\d{5}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d{1}|6553[0-5])'
     matches = re.findall(pattern, content)
     for ip, port in matches:
-        # 过滤无效端口（可选：排除 <1024 的系统端口，如果需要可以注释掉）
         if int(port) >= 1024:
             nodes.add(f"{ip}:{port}")
     
-    # 额外提取订阅链接（完整 URL）
+    # 额外提取订阅链接
     sub_pattern = r'(https?://[^\s"\']+\.(txt|yaml|yml|md|conf|sub|base64|json))'
     subs = re.findall(sub_pattern, content)
     for sub in subs:
@@ -67,14 +69,14 @@ def extract_nodes_from_content(content):
     
     return nodes
 
-# 主逻辑：搜索 + 提取 + 测试 + 保存
+# 主逻辑
 all_nodes = set()
 page = 1
 while True:
     params = {'q': SEARCH_QUERY, 'per_page': PER_PAGE, 'page': page}
     resp = requests.get(API_URL, headers=HEADERS, params=params)
     if resp.status_code != 200:
-        print(f"GitHub API 错误: {resp.status_code} - {resp.text[:200]}")
+        print(f"GitHub API 错误: {resp.status_code} - {resp.text[:300]}")
         break
     data = resp.json()
     items = data.get('items', [])
@@ -92,12 +94,12 @@ while True:
                 print(f"从 {raw_url} 提取到 {len(extracted)} 个节点/订阅")
         except Exception as e:
             print(f"处理 {raw_url} 出错: {e}")
-        time.sleep(1.2)  # 防限速
+        time.sleep(1.5)  # 防限速
 
     page += 1
-    time.sleep(4)
+    time.sleep(5)
 
-# 加载已有数据（nodes.json）
+# 加载已有数据
 try:
     with open('nodes.json', 'r', encoding='utf-8') as f:
         existing = json.load(f)
@@ -109,7 +111,7 @@ except:
 # 测试新节点
 available = []
 for node in all_nodes - existing_set:
-    alive, info = test_node(node)  # 可扩展：从内容提取 SNI 再传
+    alive, info = test_node(node)
     status = "可用" if alive else f"不可用 ({info})"
     available.append({
         "node": node,
@@ -118,9 +120,9 @@ for node in all_nodes - existing_set:
         "source": "GitHub 搜索"
     })
     print(f"测试 {node}: {status}")
-    time.sleep(1.2)
+    time.sleep(1.5)
 
-# 合并保存（可加 priority、enabled 等字段）
+# 合并保存
 output = existing.copy()
 base_priority = max([item.get('priority', 0) for item in existing] + [0]) + 1
 for idx, item in enumerate(available):
